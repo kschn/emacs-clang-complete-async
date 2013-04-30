@@ -39,6 +39,11 @@
 (require 'flymake)
 
 
+(defcustom ac-clang-cflags-file nil
+  "File wich is read for clang cflags"
+  :group 'auto-complete
+  :type 'file)
+
 (defcustom ac-clang-complete-executable
   (executable-find "clang-complete")
   "Location of clang-complete executable."
@@ -411,8 +416,8 @@ This variable will typically contain include paths, e.g., (\"-I~/MyProject\" \"-
 (defun ac-clang-send-source-code (proc)
   (save-restriction
     (widen)
-    (process-send-string 
-     proc (format "source_length:%d\n" 
+    (process-send-string
+     proc (format "source_length:%d\n"
                   (length (string-as-unibyte   ; fix non-ascii character problem
                            (buffer-substring-no-properties (point-min) (point-max)))
                           )))
@@ -491,7 +496,7 @@ This variable will typically contain include paths, e.g., (\"-I~/MyProject\" \"-
          (setq ac-clang-status 'idle)
          (ac-start)
          (ac-update))
-        
+
         (otherwise
          (setq ac-clang-current-candidate (ac-clang-parse-completion-results proc))
          ;; (message "ac-clang results arrived")
@@ -586,8 +591,6 @@ This variable will typically contain include paths, e.g., (\"-I~/MyProject\" \"-
       (ac-clang-async-preemptive)
       (self-insert-command 1)))
 
-
-
 (defun ac-clang-async-preemptive ()
   (interactive)
   (self-insert-command 1)
@@ -601,26 +604,91 @@ This variable will typically contain include paths, e.g., (\"-I~/MyProject\" \"-
 		(ac-clang-launch-completion-process-with-file filename))))
 
 (defun ac-clang-launch-completion-process-with-file (filename)
-  (setq ac-clang-completion-process
-        (let ((process-connection-type nil))
-          (apply 'start-process
-                 "clang-complete" "*clang-complete*"
-                 ac-clang-complete-executable
-                 (append (ac-clang-build-complete-args)
-                         (list filename)))))
+  (let ()
+    (setq ac-clang-cflags (ac-clang-get-cflags-for-file filename))
+    (setq ac-clang-completion-process
+          (let ((process-connection-type nil))
+            (apply 'start-process
+                   "clang-complete" "*clang-complete*"
+                   ac-clang-complete-executable
+                   (append (ac-clang-build-complete-args)
+                           (list filename)))))
 
-  (set-process-filter ac-clang-completion-process 'ac-clang-filter-output)
-  (set-process-query-on-exit-flag ac-clang-completion-process nil)
-  ;; Pre-parse source code.
-  (ac-clang-send-reparse-request ac-clang-completion-process)
+    (set-process-filter ac-clang-completion-process 'ac-clang-filter-output)
+    (set-process-query-on-exit-flag ac-clang-completion-process nil)
+    ;; Pre-parse source code.
+    (ac-clang-send-reparse-request ac-clang-completion-process)
 
-  (add-hook 'kill-buffer-hook 'ac-clang-shutdown-process nil t)
-  (add-hook 'before-save-hook 'ac-clang-reparse-buffer)
+    (add-hook 'kill-buffer-hook 'ac-clang-shutdown-process nil t)
+    (add-hook 'before-save-hook 'ac-clang-reparse-buffer)
 
-  (local-set-key (kbd ".") 'ac-clang-async-autocomplete-autotrigger)
-  (local-set-key (kbd ":") 'ac-clang-async-autocomplete-autotrigger)
-  (local-set-key (kbd ">") 'ac-clang-async-autocomplete-autotrigger))
+    (local-set-key (kbd ".") 'ac-clang-async-autocomplete-autotrigger)
+    (local-set-key (kbd ":") 'ac-clang-async-autocomplete-autotrigger)
+    (local-set-key (kbd ">") 'ac-clang-async-autocomplete-autotrigger)))
 
+
+
+;; read clfags from file
+
+(defun ac-clang-read-file-line-by-line (file)
+  "Return a list of lines in FILE."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (split-string
+     (buffer-string) "\n" t)
+    ))
+
+
+(defun ac-clang-dir= (dirname tag)
+  "Tests weather tag is contained within dirname"
+  (let ((dirname (if (string= (substring dirname -1) "/") dirname (concat dirname "/")))
+        (tag (if (string= (substring tag -1) "/") tag (concat tag "/"))))
+    (let ((tag-len (length tag))
+          (dirname-len (length dirname)))
+      (message "dirname %s:%i tag %s:%i" dirname dirname-len tag tag-len)
+      (and (>= dirname-len tag-len) (string= tag (substring dirname 0 tag-len)))
+    )
+  ))
+
+(defun ac-clang-expand-cflag (flag &optional basedir)
+"Expands an compiler flags like -I<dirname> to
+-I<basedir>/<dirname> if it is not absolute (doesn't start with a
+slash or tilde"
+
+  (if (> (length flag) 2)
+      (let ((param) (value))
+        (setq param (substring flag 0 2))
+        (setq value (substring flag 2 ))
+        (cond
+         ((string= param "-I") (concat param (expand-file-name value basedir)))
+         ;; possibly more...
+         ;; ...
+         (t flag)
+         )
+        )
+    flag
+    )
+)
+
+(defun ac-clang-get-cflags-for-file (file)
+  "Searches for cflags in 'ac-clang-cflags-file and returns the list of found flags
+Returns nil if none found"
+  (let ((in-list)                       ; Within section?
+        (dirname)                       ; Directory of the C- or C++ file
+        (cflags)                        ; List with Compiler Flags
+        (tag))                          ; Value between [ ]
+    (setq dirname (file-name-directory (file-truename file)))
+    (dolist (listelem (ac-clang-read-file-line-by-line ac-clang-cflags-file))
+      (if (string-match "\\[.*\\]" listelem)
+          (progn
+            (setq in-list (ac-clang-dir= dirname (file-truename (substring listelem 1 -1))))
+            (setq tag (substring listelem 1 -1)) ; todo: besser machen
+            )
+        (when in-list (setq cflags (cons (ac-clang-expand-cflag listelem tag) cflags)))
+       )
+    )
+    cflags
+))
 
 (ac-define-source clang-async
   '((candidates . ac-clang-candidate)
